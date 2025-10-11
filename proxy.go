@@ -11,14 +11,14 @@ import (
 	"time"
 )
 
-// CLI bayrakları
+// CLI flags
 var (
 	port        = flag.Int("port", 8080, "dinlenecek port")
 	enableCache = flag.Bool("cache", false, "GET istekleri için basit cache kullan")
 	logLevel    = flag.String("loglevel", "info", "log seviyesi: debug/info")
 )
 
-// Cache yapısı
+// Cache Structure
 type cacheEntry struct {
 	body      []byte
 	header    http.Header
@@ -31,7 +31,7 @@ var cache = struct {
 	m map[string]*cacheEntry
 }{m: make(map[string]*cacheEntry)}
 
-// main fonksiyonu
+// main function
 func main() {
 	flag.Parse()
 	addr := fmt.Sprintf(":%d", *port)
@@ -124,7 +124,7 @@ func doRequestWithRetry(req *http.Request, tries int, backoff time.Duration) (*h
 	return resp, err
 }
 
-// Header kopyalama
+// Header copying
 func copyHeaders(dst, src http.Header) {
 	for k, vv := range src {
 		for _, v := range vv {
