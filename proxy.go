@@ -1,11 +1,12 @@
 package main
 
 import (
-	"context"
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -13,12 +14,13 @@ import (
 
 // CLI flags
 var (
-	port        = flag.Int("port", 8080, "dinlenecek port")
-	enableCache = flag.Bool("cache", false, "GET istekleri için basit cache kullan")
-	logLevel    = flag.String("loglevel", "info", "log seviyesi: debug/info")
+	port        = flag.Int("port", 8080, "Port to listen on")
+	enableCache = flag.Bool("cache", false, "Enable simple cache for GET requests")
+	logLevel    = flag.String("loglevel", "info", "Log level: debug/info")
+	forwardMode = flag.Bool("forward", false, "Enable forward proxy mode (CONNECT + any site)")
 )
 
-// Cache Structure
+// Cache structure
 type cacheEntry struct {
 	body      []byte
 	header    http.Header
@@ -31,25 +33,29 @@ var cache = struct {
 	m map[string]*cacheEntry
 }{m: make(map[string]*cacheEntry)}
 
-// main function
 func main() {
 	flag.Parse()
 	addr := fmt.Sprintf(":%d", *port)
 	http.HandleFunc("/", proxyHandler)
 
-	log.Printf("Proxy başlatıldı: http://localhost%s (Cache: %v, Log seviyesi: %s)", addr, *enableCache, *logLevel)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	mode := "Reverse Proxy"
+	if *forwardMode {
+		mode = "Forward Proxy"
+	}
+
+	log.Printf("%s started: https://localhost%s (Cache: %v, Log level: %s)", mode, addr, *enableCache, *logLevel)
+	log.Fatal(http.ListenAndServeTLS(addr, "cert.pem", "key.pem", nil))
 }
 
 // Proxy handler
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
-	if *logLevel == "debug" {
-		log.Println("[ISTEK]", r.Method, r.URL.String())
+	if *forwardMode && r.Method == http.MethodConnect {
+		handleConnect(w, r)
+		return
 	}
 
-	if r.Method == http.MethodConnect {
-		http.Error(w, "HTTPS CONNECT desteklenmiyor", http.StatusMethodNotAllowed)
-		return
+	if *logLevel == "debug" {
+		log.Println("[REQUEST]", r.Method, r.URL.String())
 	}
 
 	cacheKey := r.Method + ":" + r.URL.String()
@@ -66,65 +72,85 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
+	var targetURL string
+	if *forwardMode {
+		// Forward proxy mode: request URL is taken as is
+		targetURL = r.URL.String()
+	} else {
+		// Reverse proxy mode: use original request host (or set your backend here)
+		targetURL = r.URL.String()
+	}
+
+	bodyBytes, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+
+	outReq, err := http.NewRequest(r.Method, targetURL, io.NopCloser(bytes.NewReader(bodyBytes)))
 	if err != nil {
-		http.Error(w, "İstek hazırlanamadı: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Failed to create request: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	copyHeaders(outReq.Header, r.Header)
 
-	resp, err := doRequestWithRetry(outReq, 3, 500*time.Millisecond)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(outReq)
 	if err != nil {
-		http.Error(w, "Sunucu hatası: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "Upstream server error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-
+	respBody, _ := io.ReadAll(resp.Body)
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	w.Write(body)
+	w.Write(respBody)
 
 	if *enableCache && r.Method == http.MethodGet && resp.StatusCode == 200 {
 		cache.Lock()
 		cache.m[cacheKey] = &cacheEntry{
-			body:      append([]byte(nil), body...),
+			body:      append([]byte(nil), respBody...),
 			header:    resp.Header.Clone(),
 			status:    resp.StatusCode,
 			expiresAt: time.Now().Add(30 * time.Second),
 		}
 		cache.Unlock()
 	}
+
 	log.Println("[PROXY]", r.Method, r.URL.String(), "->", resp.StatusCode)
 }
 
-// Retry fonksiyonu
-func doRequestWithRetry(req *http.Request, tries int, backoff time.Duration) (*http.Response, error) {
-	var resp *http.Response
-	var err error
+// Handle HTTPS CONNECT for forward proxy
+func handleConnect(w http.ResponseWriter, r *http.Request) {
+	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	if err != nil {
+		http.Error(w, "Failed to connect to host: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	defer destConn.Close()
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		http.Error(w, "Hijacking failed: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	defer clientConn.Close()
+
+	// Send 200 OK to client
+	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	if err != nil {
+		return
 	}
 
-	for i := 0; i < tries; i++ {
-		r := req.Clone(context.Background())
-		resp, err = client.Do(r)
-		if err == nil && resp.StatusCode < 500 {
-			return resp, nil
-		}
-		if resp != nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}
-		time.Sleep(backoff)
-		backoff *= 2
-	}
-	return resp, err
+	// Bi-directional copy
+	go io.Copy(destConn, clientConn)
+	io.Copy(clientConn, destConn)
 }
 
-// Header copying
+// Copy headers helper
 func copyHeaders(dst, src http.Header) {
 	for k, vv := range src {
 		for _, v := range vv {
