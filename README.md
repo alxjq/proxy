@@ -1,30 +1,34 @@
-# Self-Signed HTTPS Proxy (Go)
+# Go Hybrid Reverse + Forward Proxy
 
-This project is a **simple HTTPS reverse proxy** written in Go.  
-It uses a **self-signed certificate** for local development and testing, providing encrypted TLS communication.
+This project is a **hybrid proxy** written in Go, capable of acting as both a **reverse proxy** and a **forward proxy**.  
+
+- By default, it works as a **reverse proxy**, forwarding requests to a backend.  
+- With the `-forward` flag, it can act as a **forward proxy**, allowing clients to access any HTTP/HTTPS site.  
+- Supports **self-signed TLS**, caching, and logging.
+
+---
 
 ## Features
 
-- HTTPS (self-signed certificate)
-- Basic GET request caching (with TTL)
-- Retry mechanism for idempotent requests
-- Logging with debug/info levels
-- Concurrency-safe cache
+- Reverse Proxy (default)  
+- Forward Proxy (`-forward=true`)  
+- HTTPS support with self-signed certificate  
+- GET request caching (TTL: 30 seconds)  
+- Logging with debug/info levels  
+- Concurrency-safe
 
 ---
 
 ## Requirements
 
-- Go 1.20+ (or latest)
-- OpenSSL (for generating certificates)
+- Go 1.20+  
+- OpenSSL (for generating self-signed certificate)
 
 ---
 
-## Setup & Run
+## Setup
 
 ### 1️⃣ Generate self-signed certificate
-
-Run the following in your terminal:
 
 ```bash
 openssl req -x509 -newkey rsa:2048 -nodes \
