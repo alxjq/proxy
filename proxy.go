@@ -18,6 +18,7 @@ var (
 	enableCache = flag.Bool("cache", false, "Enable simple cache for GET requests")
 	logLevel    = flag.String("loglevel", "info", "Log level: debug/info")
 	forwardMode = flag.Bool("forward", false, "Enable forward proxy mode (CONNECT + any site)")
+	upstream    = flag.String("upstream", "http://localhost:9000", "Upstream server for reverse proxy")
 )
 
 // Cache structure
@@ -59,6 +60,8 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cacheKey := r.Method + ":" + r.URL.String()
+
+	// Cache check
 	if *enableCache && r.Method == http.MethodGet {
 		cache.RLock()
 		ce, ok := cache.m[cacheKey]
@@ -72,27 +75,37 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var targetURL string
-	if *forwardMode {
-		// Forward proxy mode: request URL is taken as is
-		targetURL = r.URL.String()
-	} else {
-		// Reverse proxy mode: use original request host (or set your backend here)
-		targetURL = r.URL.String()
-	}
-
 	bodyBytes, _ := io.ReadAll(r.Body)
 	r.Body.Close()
 
-	outReq, err := http.NewRequest(r.Method, targetURL, io.NopCloser(bytes.NewReader(bodyBytes)))
+	var targetURL string
+
+	if *forwardMode {
+		// Forward proxy (full URL gerekir)
+		if r.URL.Scheme == "" {
+			targetURL = "http://" + r.Host + r.RequestURI
+		} else {
+			targetURL = r.URL.String()
+		}
+	} else {
+		// Reverse proxy (FIX)
+		targetURL = *upstream + r.RequestURI
+	}
+
+	outReq, err := http.NewRequestWithContext(
+		r.Context(),
+		r.Method,
+		targetURL,
+		io.NopCloser(bytes.NewReader(bodyBytes)),
+	)
 	if err != nil {
 		http.Error(w, "Failed to create request: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+
 	copyHeaders(outReq.Header, r.Header)
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(outReq)
+	resp, err := doRequestWithRetry(outReq, 3, 500*time.Millisecond)
 	if err != nil {
 		http.Error(w, "Upstream server error: "+err.Error(), http.StatusBadGateway)
 		return
@@ -100,10 +113,12 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
+
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	w.Write(respBody)
 
+	// Cache store
 	if *enableCache && r.Method == http.MethodGet && resp.StatusCode == 200 {
 		cache.Lock()
 		cache.m[cacheKey] = &cacheEntry{
@@ -118,11 +133,11 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("[PROXY]", r.Method, r.URL.String(), "->", resp.StatusCode)
 }
 
-// Handle HTTPS CONNECT for forward proxy
+// Handle HTTPS CONNECT
 func handleConnect(w http.ResponseWriter, r *http.Request) {
 	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
 	if err != nil {
-		http.Error(w, "Failed to connect to host: "+err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, "Failed to connect: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	defer destConn.Close()
@@ -132,25 +147,50 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
 		return
 	}
+
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		http.Error(w, "Hijacking failed: "+err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, "Hijack failed: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	defer clientConn.Close()
 
-	// Send 200 OK to client
-	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	if err != nil {
-		return
-	}
+	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	// Bi-directional copy
 	go io.Copy(destConn, clientConn)
 	io.Copy(clientConn, destConn)
 }
 
-// Copy headers helper
+// Retry logic
+func doRequestWithRetry(req *http.Request, tries int, backoff time.Duration) (*http.Response, error) {
+	var resp *http.Response
+	var err error
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	for i := 0; i < tries; i++ {
+		r := req.Clone(req.Context())
+
+		resp, err = client.Do(r)
+		if err == nil && resp.StatusCode < 500 {
+			return resp, nil
+		}
+
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+
+		time.Sleep(backoff)
+		backoff *= 2
+	}
+
+	return resp, err
+}
+
+// Header copy helper
 func copyHeaders(dst, src http.Header) {
 	for k, vv := range src {
 		for _, v := range vv {
